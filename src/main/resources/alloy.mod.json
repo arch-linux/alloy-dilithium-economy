@@ -1,0 +1,8 @@
+{
+  "id": "dilithium-economy",
+  "name": "Dilithium Economy",
+  "version": "1.0.0",
+  "description": "Cryptocurrency-backed economy using the Dilithium blockchain",
+  "authors": ["dilithiumcoin"],
+  "entrypoint": "com.dilithium.economy.DilithiumEconomyMod"
+}
