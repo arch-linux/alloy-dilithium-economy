@@ -4,31 +4,45 @@ import com.dilithium.economy.blockchain.BlockchainClient;
 import com.dilithium.economy.blockchain.TransactionBuilder;
 import com.dilithium.economy.crypto.WalletData;
 import com.dilithium.economy.economy.BalanceCache;
+import com.dilithium.economy.wallet.ReserveWallet;
 import com.dilithium.economy.wallet.WalletManager;
 import net.alloymc.api.AlloyAPI;
 import net.alloymc.api.command.Command;
 import net.alloymc.api.command.CommandSender;
 import net.alloymc.api.entity.Player;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
- * /pay <player> <amount> — Blockchain transfer between players.
+ * /pay &lt;player|reserve&gt; &lt;amount&gt; — Blockchain transfer.
+ *
+ * <p>Targets:
+ * <ul>
+ *   <li>{@code /pay <player> <amount>} — Send DLT to another player's wallet</li>
+ *   <li>{@code /pay reserve <amount>} — Send DLT to the server's reserve wallet</li>
+ * </ul>
+ *
+ * <p>Uses atomic {@link BalanceCache#tryDebit} to prevent double-spending.
+ * If the blockchain node rejects the TX, the pending debit is rolled back immediately.
  */
 public final class PayCommand extends Command {
 
     private final WalletManager walletManager;
+    private final ReserveWallet reserveWallet;
     private final BalanceCache balanceCache;
     private final BlockchainClient client;
     private final String networkName;
     private final long defaultFee;
 
-    public PayCommand(WalletManager walletManager, BalanceCache balanceCache,
-                      BlockchainClient client, String networkName, long defaultFee) {
-        super("pay", "Send DLT to another player", "dilithium.pay");
+    public PayCommand(WalletManager walletManager, ReserveWallet reserveWallet,
+                      BalanceCache balanceCache, BlockchainClient client,
+                      String networkName, long defaultFee) {
+        super("pay", "Send DLT to a player or the server reserve", "dilithium.pay");
         this.walletManager = walletManager;
+        this.reserveWallet = reserveWallet;
         this.balanceCache = balanceCache;
         this.client = client;
         this.networkName = networkName;
@@ -45,7 +59,7 @@ public final class PayCommand extends Command {
         Player player = (Player) sender;
 
         if (args.length < 2) {
-            player.sendMessage("Usage: /pay <player> <amount>");
+            player.sendMessage("Usage: /pay <player|reserve> <amount>");
             return true;
         }
 
@@ -63,60 +77,91 @@ public final class PayCommand extends Command {
             return true;
         }
 
-        // Find target player
-        Optional<? extends Player> targetOpt = AlloyAPI.server().player(targetName);
-        if (targetOpt.isEmpty()) {
-            player.sendMessage("Player not found: " + targetName);
-            return true;
-        }
-
-        Player target = targetOpt.get();
-        if (target.uniqueId().equals(player.uniqueId())) {
-            player.sendMessage("You can't pay yourself.");
-            return true;
-        }
-
         UUID senderId = player.uniqueId();
-        UUID receiverId = target.uniqueId();
-
         WalletData senderWallet = walletManager.getWallet(senderId);
-        WalletData receiverWallet = walletManager.getWallet(receiverId);
-
         if (senderWallet == null) {
             player.sendMessage("You don't have a wallet. Rejoin the server to create one.");
             return true;
         }
-        if (receiverWallet == null) {
-            player.sendMessage(target.displayName() + " doesn't have a wallet yet.");
-            return true;
+
+        // Determine target address and display name
+        String targetAddress;
+        String targetDisplayName;
+
+        if (targetName.equalsIgnoreCase("reserve") || targetName.equalsIgnoreCase("server")) {
+            targetAddress = reserveWallet.address();
+            targetDisplayName = "Server Reserve";
+        } else {
+            Optional<? extends Player> targetOpt = AlloyAPI.server().player(targetName);
+            if (targetOpt.isEmpty()) {
+                player.sendMessage("Player not found: " + targetName
+                        + ". Use /payaddress to send to a raw address.");
+                return true;
+            }
+
+            Player target = targetOpt.get();
+            if (target.uniqueId().equals(player.uniqueId())) {
+                player.sendMessage("You can't pay yourself.");
+                return true;
+            }
+
+            WalletData receiverWallet = walletManager.getWallet(target.uniqueId());
+            if (receiverWallet == null) {
+                player.sendMessage(target.displayName() + " doesn't have a wallet yet.");
+                return true;
+            }
+
+            targetAddress = receiverWallet.address();
+            targetDisplayName = target.displayName();
+
+            // Optimistically credit receiver for immediate UX
+            long creditUnits = TransactionBuilder.toBaseUnits(amount);
+            balanceCache.addPendingCredit(targetAddress, creditUnits);
         }
 
         long baseUnits = TransactionBuilder.toBaseUnits(amount);
         long totalCost = baseUnits + defaultFee;
-        long senderBalance = balanceCache.getBalance(senderWallet.address());
 
-        if (senderBalance < totalCost) {
-            player.sendMessage("Insufficient balance. You have " + TransactionBuilder.formatDLT(senderBalance)
-                    + " DLT (need " + TransactionBuilder.formatDLT(totalCost) + " DLT including fee).");
+        // Atomically check balance and reserve funds
+        BalanceCache.DebitResult debitResult = balanceCache.tryDebit(senderWallet.address(), totalCost);
+        if (!debitResult.success()) {
+            String sym = AlloyAPI.economy().currencySymbol();
+            player.sendMessage("Insufficient balance. You have " + sym
+                    + TransactionBuilder.formatDLT(debitResult.remainingBalance())
+                    + " (need " + sym + TransactionBuilder.formatDLT(totalCost)
+                    + " including " + sym + TransactionBuilder.formatDLT(defaultFee) + " fee).");
+            long pendingTotal = balanceCache.getTotalPendingDebits(senderWallet.address());
+            if (pendingTotal > 0) {
+                player.sendMessage("(" + sym + TransactionBuilder.formatDLT(pendingTotal)
+                        + " locked in pending transactions)");
+            }
             return true;
         }
 
-        // Optimistically update caches
-        balanceCache.recordPendingDebit(senderWallet.address(), totalCost);
-        balanceCache.recordPendingCredit(receiverWallet.address(), baseUnits);
+        String txId = debitResult.txId();
+        String formattedAmount = TransactionBuilder.formatDLT(baseUnits);
+        String sym = AlloyAPI.economy().currencySymbol();
+        String finalTargetAddress = targetAddress;
+        String finalTargetDisplayName = targetDisplayName;
 
         // Submit TX async
-        String formattedAmount = TransactionBuilder.formatDLT(baseUnits);
         Thread.ofVirtual().name("DilithiumEconomy-Pay").start(() -> {
             boolean ok = TransactionBuilder.buildAndSubmit(
-                    senderWallet, receiverWallet.address(), baseUnits, defaultFee, networkName, client);
+                    senderWallet, finalTargetAddress, baseUnits, defaultFee, networkName, client);
             if (ok) {
-                player.sendMessage("Sent " + formattedAmount + " DLT to " + target.displayName()
-                        + "! Transaction submitted to blockchain. Mining in ~60s.");
-                target.sendMessage("Received " + formattedAmount + " DLT from " + player.displayName()
-                        + "! Transaction is being mined.");
+                player.sendMessage("Sent " + sym + formattedAmount + " to " + finalTargetDisplayName
+                        + "! TX submitted to blockchain.");
+
+                // Notify target if it's an online player (not reserve)
+                if (!finalTargetAddress.equals(reserveWallet.address())) {
+                    Optional<? extends Player> targetOpt = AlloyAPI.server().player(finalTargetDisplayName);
+                    targetOpt.ifPresent(t -> t.sendMessage("Received " + sym + formattedAmount
+                            + " from " + player.displayName() + "! Transaction is being mined."));
+                }
             } else {
-                player.sendMessage("Transaction failed! The blockchain node may be unreachable.");
+                balanceCache.removePendingDebit(txId);
+                player.sendMessage("Transaction failed! Your balance has been restored. "
+                        + "The blockchain node may be unreachable.");
             }
         });
 
@@ -127,8 +172,12 @@ public final class PayCommand extends Command {
     public List<String> tabComplete(CommandSender sender, String label, String[] args) {
         if (args.length == 1) {
             String partial = args[0].toLowerCase();
-            return AlloyAPI.server().onlinePlayers().stream()
+            List<String> suggestions = new ArrayList<>();
+            suggestions.add("reserve");
+            AlloyAPI.server().onlinePlayers().stream()
                     .map(Player::name)
+                    .forEach(suggestions::add);
+            return suggestions.stream()
                     .filter(n -> n.toLowerCase().startsWith(partial))
                     .toList();
         }

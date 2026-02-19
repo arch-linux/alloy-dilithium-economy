@@ -57,12 +57,12 @@ public final class TransactionBuilder {
     }
 
     /**
-     * Formats base units as a human-readable DLT string with 8 decimal places.
-     * Matches Go's FormatDLT: "whole.fractional" with zero-padded 8 digits.
+     * Formats base units as a human-readable DLT string with 2 decimal places.
      */
     public static String formatDLT(long baseUnits) {
         long whole = baseUnits / DLT_UNIT;
         long frac = Math.abs(baseUnits % DLT_UNIT);
-        return String.format("%d.%08d", whole, frac);
+        long twoDigitFrac = frac / (DLT_UNIT / 100);
+        return String.format("%d.%02d", whole, twoDigitFrac);
     }
 }

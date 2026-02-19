@@ -17,7 +17,7 @@ repositories {
 dependencies {
     compileOnly(files("libs/alloy-api.jar"))
     compileOnly(files("libs/alloy-loader.jar"))
-    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.76")
     implementation("com.google.code.gson:gson:2.11.0")
 }
 
@@ -32,7 +32,9 @@ tasks.jar {
 
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
-    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
+    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) }) {
+        exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/*.EC")
+    }
 
     manifest {
         attributes("Implementation-Title" to "DilithiumEconomy")

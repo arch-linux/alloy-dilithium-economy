@@ -14,9 +14,13 @@ import java.util.concurrent.Executors;
 /**
  * EconomyProvider backed by the Dilithium blockchain.
  *
- * Optimistic local cache: synchronous methods return immediately using cached balances.
- * Actual blockchain transactions are submitted asynchronously.
- * Periodic sync (via BalanceCache) reconciles cache with on-chain truth.
+ * <p>Uses {@link BalanceCache} for pending transaction tracking to prevent
+ * double-spending. All outgoing TXs go through {@link BalanceCache#tryDebit}
+ * which atomically checks balance and reserves funds. If the node rejects
+ * the TX, the pending debit is rolled back immediately.
+ *
+ * <p>Deposits use optimistic credits — the player sees the balance immediately
+ * and it reconciles on the next sync cycle.
  */
 public final class DilithiumEconomyProvider implements EconomyProvider {
 
@@ -54,13 +58,9 @@ public final class DilithiumEconomyProvider implements EconomyProvider {
 
     @Override
     public void setBalance(UUID playerId, double amount) {
-        double current = getBalance(playerId);
-        double delta = amount - current;
-        if (delta > 0) {
-            deposit(playerId, delta);
-        } else if (delta < 0) {
-            withdraw(playerId, -delta);
-        }
+        // Cannot directly set a blockchain balance. Use deposit/withdraw for adjustments.
+        System.err.println("[DilithiumEconomy] setBalance() is not supported on blockchain economy. "
+                + "Use deposit/withdraw instead. Player: " + playerId + " requested: " + amount);
     }
 
     @Override
@@ -74,15 +74,17 @@ public final class DilithiumEconomyProvider implements EconomyProvider {
         long baseUnits = TransactionBuilder.toBaseUnits(amount);
         if (baseUnits <= 0) return;
 
-        // Optimistically credit the player's cache
-        balanceCache.recordPendingCredit(playerWallet.address(), baseUnits);
+        // Optimistically credit the player's cache for immediate UX
+        balanceCache.addPendingCredit(playerWallet.address(), baseUnits);
 
         // Submit TX async: reserve → player
         txExecutor.submit(() -> {
             boolean ok = TransactionBuilder.buildAndSubmit(
                     reserveWallet.wallet(), playerWallet.address(), baseUnits, defaultFee, networkName, client);
             if (!ok) {
-                System.err.println("[DilithiumEconomy] Deposit TX failed for " + playerId);
+                System.err.println("[DilithiumEconomy] Deposit TX failed for " + playerId
+                        + " (" + TransactionBuilder.formatDLT(baseUnits) + " DLT). "
+                        + "Credit will be corrected on next sync.");
             }
         });
     }
@@ -96,18 +98,22 @@ public final class DilithiumEconomyProvider implements EconomyProvider {
         if (baseUnits <= 0) return false;
 
         long totalCost = baseUnits + defaultFee;
-        long currentBalance = balanceCache.getBalance(playerWallet.address());
-        if (currentBalance < totalCost) return false;
 
-        // Optimistically debit the player's cache
-        balanceCache.recordPendingDebit(playerWallet.address(), totalCost);
+        // Atomically check balance and reserve funds
+        BalanceCache.DebitResult result = balanceCache.tryDebit(playerWallet.address(), totalCost);
+        if (!result.success()) return false;
+
+        String txId = result.txId();
 
         // Submit TX async: player → reserve
         txExecutor.submit(() -> {
             boolean ok = TransactionBuilder.buildAndSubmit(
                     playerWallet, reserveWallet.address(), baseUnits, defaultFee, networkName, client);
             if (!ok) {
-                System.err.println("[DilithiumEconomy] Withdraw TX failed for " + playerId);
+                // TX rejected — immediately rollback the pending debit
+                balanceCache.removePendingDebit(txId);
+                System.err.println("[DilithiumEconomy] Withdraw TX failed for " + playerId
+                        + " (" + TransactionBuilder.formatDLT(baseUnits) + " DLT). Pending debit rolled back.");
             }
         });
 
@@ -129,19 +135,25 @@ public final class DilithiumEconomyProvider implements EconomyProvider {
         if (baseUnits <= 0) return false;
 
         long totalCost = baseUnits + defaultFee;
-        long senderBalance = balanceCache.getBalance(senderWallet.address());
-        if (senderBalance < totalCost) return false;
 
-        // Optimistically update caches
-        balanceCache.recordPendingDebit(senderWallet.address(), totalCost);
-        balanceCache.recordPendingCredit(receiverWallet.address(), baseUnits);
+        // Atomically check sender balance and reserve funds
+        BalanceCache.DebitResult result = balanceCache.tryDebit(senderWallet.address(), totalCost);
+        if (!result.success()) return false;
+
+        String txId = result.txId();
+
+        // Optimistically credit receiver
+        balanceCache.addPendingCredit(receiverWallet.address(), baseUnits);
 
         // Submit TX async: sender → receiver
         txExecutor.submit(() -> {
             boolean ok = TransactionBuilder.buildAndSubmit(
                     senderWallet, receiverWallet.address(), baseUnits, defaultFee, networkName, client);
             if (!ok) {
-                System.err.println("[DilithiumEconomy] Transfer TX failed: " + from + " -> " + to);
+                // TX rejected — rollback sender's pending debit
+                balanceCache.removePendingDebit(txId);
+                System.err.println("[DilithiumEconomy] Transfer TX failed: " + from + " -> " + to
+                        + " (" + TransactionBuilder.formatDLT(baseUnits) + " DLT). Pending debit rolled back.");
             }
         });
 

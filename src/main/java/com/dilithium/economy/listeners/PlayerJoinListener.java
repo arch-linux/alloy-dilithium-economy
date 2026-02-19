@@ -26,7 +26,8 @@ public final class PlayerJoinListener implements Listener {
 
         if (!walletManager.hasWallet(playerId)) {
             String address = walletManager.createWallet(playerId);
-            player.sendMessage("Wallet created! Your address: " + address);
+            player.sendMessage("Wallet created! Your address:");
+            player.sendClickableMessage(address, address);
             System.out.println("[DilithiumEconomy] Created wallet for " + player.name() + ": " + address);
         } else {
             // Sync balance on join
