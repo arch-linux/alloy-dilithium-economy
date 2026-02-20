@@ -125,6 +125,9 @@ public final class PayAddressCommand extends Command {
                         + "! TX submitted to blockchain.");
 
                 // Notify target if they're an online player
+                // Record as expected so sync loop won't double-notify
+                balanceCache.recordExpectedIncoming(targetAddress, senderWallet.address(), baseUnits);
+
                 if (targetPlayerId != null) {
                     AlloyAPI.server().player(targetPlayerId).ifPresent(t ->
                             t.sendMessage("Received " + sym + formattedAmount

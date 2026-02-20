@@ -1,6 +1,7 @@
 package com.dilithium.economy;
 
 import com.dilithium.economy.blockchain.BlockchainClient;
+import com.dilithium.economy.blockchain.TransactionBuilder;
 import com.dilithium.economy.commands.BalanceOverrideCommand;
 import com.dilithium.economy.commands.BankReserveCommand;
 import com.dilithium.economy.commands.DilithiumCommand;
@@ -13,10 +14,13 @@ import com.dilithium.economy.listeners.PlayerJoinListener;
 import com.dilithium.economy.wallet.ReserveWallet;
 import com.dilithium.economy.wallet.WalletManager;
 import net.alloymc.api.AlloyAPI;
+import net.alloymc.api.entity.Player;
 import net.alloymc.api.permission.PermissionRegistry;
 import net.alloymc.loader.api.ModInitializer;
 
 import java.nio.file.Path;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Dilithium Economy mod entry point.
@@ -65,6 +69,43 @@ public final class DilithiumEconomyMod implements ModInitializer {
         };
         BalanceCache balanceCache = new BalanceCache(client, allAddresses,
                 config.syncIntervalSeconds(), config.maxPendingSeconds());
+
+        // Configure incoming transaction notifications
+        balanceCache.setReserveAddress(reserveWallet.address());
+        balanceCache.setTransactionListener((toAddress, fromAddress, amount) -> {
+            // Look up the recipient player
+            UUID recipientId = walletManager.getPlayerByAddress(toAddress);
+            if (recipientId == null) return; // not a known player wallet
+
+            Optional<? extends Player> recipientOpt = AlloyAPI.server().player(recipientId);
+            if (recipientOpt.isEmpty()) return; // player is offline
+
+            Player recipient = recipientOpt.get();
+            String sym = AlloyAPI.economy().currencySymbol();
+            String formattedAmount = TransactionBuilder.formatDLT(amount);
+
+            String senderLabel;
+            if (fromAddress == null) {
+                senderLabel = "an unknown source";
+            } else {
+                // Look up sender in our address-to-player LUT
+                UUID senderId = walletManager.getPlayerByAddress(fromAddress);
+                if (senderId != null) {
+                    senderLabel = AlloyAPI.server().player(senderId)
+                            .map(Player::displayName)
+                            .orElse("Player " + senderId.toString().substring(0, 8));
+                } else {
+                    // Unknown address — show shortened address
+                    String shortAddr = fromAddress.length() > 12
+                            ? fromAddress.substring(0, 6) + "..." + fromAddress.substring(fromAddress.length() - 6)
+                            : fromAddress;
+                    senderLabel = "external " + shortAddr;
+                }
+            }
+
+            recipient.sendMessage("Received " + sym + formattedAmount + " from " + senderLabel
+                    + ". Transaction will settle soon.");
+        });
 
         // Sync reserve wallet balance on startup
         if (nodeReachable) {

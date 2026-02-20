@@ -11,6 +11,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * HTTP REST client for the Dilithium blockchain node.
@@ -119,6 +121,55 @@ public final class BlockchainClient {
             return response.statusCode() == 200;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * A transaction received from the blockchain explorer.
+     */
+    public record ChainTransaction(String hash, String from, String to, long amount, long timestamp) {}
+
+    /**
+     * Queries the blockchain explorer for incoming transactions to an address.
+     * Parses the "transactions" array from GET /explorer/address response.
+     * Returns only transactions where {@code to} equals the queried address.
+     *
+     * @return list of incoming transactions, or empty list if unavailable
+     */
+    public List<ChainTransaction> getIncomingTransactions(String address) {
+        try {
+            String url = baseUrl + "/explorer/address?addr=" + URLEncoder.encode(address, StandardCharsets.UTF_8);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(TIMEOUT)
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) return List.of();
+
+            JsonObject json = GSON.fromJson(response.body(), JsonObject.class);
+            if (!json.has("data")) return List.of();
+
+            JsonObject data = json.getAsJsonObject("data");
+            if (!data.has("transactions")) return List.of();
+
+            List<ChainTransaction> incoming = new ArrayList<>();
+            for (JsonElement elem : data.getAsJsonArray("transactions")) {
+                JsonObject tx = elem.getAsJsonObject();
+                String to = tx.has("to") ? tx.get("to").getAsString() : "";
+                if (!address.equals(to)) continue; // only incoming
+
+                String hash = tx.has("hash") ? tx.get("hash").getAsString() : "";
+                String from = tx.has("from") ? tx.get("from").getAsString() : "";
+                long amount = tx.has("amount") ? tx.get("amount").getAsLong() : 0;
+                long timestamp = tx.has("timestamp") ? tx.get("timestamp").getAsLong() : 0;
+                incoming.add(new ChainTransaction(hash, from, to, amount, timestamp));
+            }
+            return incoming;
+        } catch (Exception e) {
+            // Transaction history not available — graceful degradation
+            return List.of();
         }
     }
 

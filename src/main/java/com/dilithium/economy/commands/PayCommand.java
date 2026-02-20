@@ -154,6 +154,9 @@ public final class PayCommand extends Command {
 
                 // Notify target if it's an online player (not reserve)
                 if (!finalTargetAddress.equals(reserveWallet.address())) {
+                    // Record as expected so sync loop won't double-notify
+                    balanceCache.recordExpectedIncoming(finalTargetAddress, senderWallet.address(), baseUnits);
+
                     Optional<? extends Player> targetOpt = AlloyAPI.server().player(finalTargetDisplayName);
                     targetOpt.ifPresent(t -> t.sendMessage("Received " + sym + formattedAmount
                             + " from " + player.displayName() + "! Transaction is being mined."));

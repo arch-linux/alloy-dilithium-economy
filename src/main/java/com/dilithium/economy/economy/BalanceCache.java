@@ -54,6 +54,26 @@ public final class BalanceCache {
         }
     }
 
+    /**
+     * Listener for incoming transactions detected during the sync cycle.
+     * Called when a new incoming transaction is found that the recipient did not initiate.
+     */
+    @FunctionalInterface
+    public interface IncomingTransactionListener {
+        /**
+         * @param toAddress   the recipient's wallet address
+         * @param fromAddress the sender's wallet address
+         * @param amount      the amount in base units
+         */
+        void onIncomingTransaction(String toAddress, String fromAddress, long amount);
+    }
+
+    /**
+     * Key for tracking expected incoming transactions (to avoid double-notification).
+     * Used when PayCommand or PayAddressCommand already notified the receiver.
+     */
+    private record ExpectedIncoming(String toAddress, String fromAddress, long amount, long createdAt) {}
+
     /** On-chain balances in base units (updated by sync) */
     private final ConcurrentHashMap<String, Long> onChainBalances = new ConcurrentHashMap<>();
 
@@ -68,6 +88,21 @@ public final class BalanceCache {
 
     /** Lock object for atomic check-and-debit */
     private final Object debitLock = new Object();
+
+    /** Last processed transaction timestamp per address (for incoming TX detection) */
+    private final ConcurrentHashMap<String, Long> lastProcessedTxTime = new ConcurrentHashMap<>();
+
+    /** Whether the first sync has completed (skip notifications on first sync to avoid spam) */
+    private final AtomicBoolean firstSyncDone = new AtomicBoolean(false);
+
+    /** Expected incoming transactions — recorded when the mod sends a notification itself */
+    private final CopyOnWriteArrayList<ExpectedIncoming> expectedIncomings = new CopyOnWriteArrayList<>();
+
+    /** Listener for incoming transactions (set by mod entry point) */
+    private volatile IncomingTransactionListener txListener;
+
+    /** Reserve wallet address — skip notifications for TXs from reserve (economy deposits) */
+    private volatile String reserveAddress;
 
     private final BlockchainClient client;
     private final Supplier<Set<String>> addressSupplier;
@@ -149,6 +184,29 @@ public final class BalanceCache {
     }
 
     /**
+     * Sets the listener that will be called when new incoming transactions are detected.
+     */
+    public void setTransactionListener(IncomingTransactionListener listener) {
+        this.txListener = listener;
+    }
+
+    /**
+     * Sets the reserve wallet address. Incoming TXs from this address are
+     * silently ignored (economy deposits, shop sales, etc.).
+     */
+    public void setReserveAddress(String address) {
+        this.reserveAddress = address;
+    }
+
+    /**
+     * Records an expected incoming transaction so the sync loop won't re-notify.
+     * Called by PayCommand/PayAddressCommand after they've already notified the receiver.
+     */
+    public void recordExpectedIncoming(String toAddress, String fromAddress, long amount) {
+        expectedIncomings.add(new ExpectedIncoming(toAddress, fromAddress, amount, System.currentTimeMillis()));
+    }
+
+    /**
      * Returns all pending debits for a given address (for display to the player).
      */
     public List<PendingDebit> getPendingDebits(String address) {
@@ -213,6 +271,10 @@ public final class BalanceCache {
                 System.out.println("[DilithiumEconomy] Blockchain node is back online.");
             }
 
+            // Expire old expected incoming records
+            long now = System.currentTimeMillis();
+            expectedIncomings.removeIf(e -> (now - e.createdAt()) > maxPendingMs);
+
             Set<String> addresses = addressSupplier.get();
             for (String address : addresses) {
                 try {
@@ -227,13 +289,88 @@ public final class BalanceCache {
                     }
 
                     expirePendingDebits(address);
+
+                    // Detect new incoming transactions for notification
+                    if (txListener != null && firstSyncDone.get()) {
+                        detectIncomingTransactions(address, previousBalance, onChainBalance);
+                    }
                 } catch (Exception e) {
                     // Individual address failure, continue with others
                 }
             }
+
+            firstSyncDone.set(true);
         } catch (Exception e) {
             System.err.println("[DilithiumEconomy] Balance sync failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Checks for new incoming transactions to an address and notifies the listener.
+     * Only triggers when the on-chain balance increased (indicating received funds).
+     * Skips transactions from the reserve wallet and ones already expected.
+     */
+    private void detectIncomingTransactions(String address, Long previousBalance, long onChainBalance) {
+        // Only check when balance increased
+        if (previousBalance == null || onChainBalance <= previousBalance) return;
+
+        // Skip the reserve wallet itself — it receives funds constantly
+        String reserve = reserveAddress;
+        if (reserve != null && reserve.equals(address)) return;
+
+        // Query blockchain for transaction history
+        var transactions = client.getIncomingTransactions(address);
+        if (transactions.isEmpty()) {
+            // Blockchain didn't return transaction details — fall back to balance delta notification
+            long increase = onChainBalance - previousBalance;
+            long credits = pendingCredits.getOrDefault(address, 0L);
+            long unexplained = increase - credits;
+            if (unexplained > 0 && !isExpectedIncoming(address, null, unexplained)) {
+                txListener.onIncomingTransaction(address, null, unexplained);
+            }
+            return;
+        }
+
+        // Process transaction history — notify about new incoming TXs
+        long lastTs = lastProcessedTxTime.getOrDefault(address, 0L);
+        long maxTs = lastTs;
+
+        for (var tx : transactions) {
+            if (tx.timestamp() <= lastTs) continue; // already processed
+            maxTs = Math.max(maxTs, tx.timestamp());
+
+            // Skip transactions from the reserve wallet (economy deposits, shop sales)
+            if (reserve != null && reserve.equals(tx.from())) continue;
+
+            // Skip if this was already expected (PayCommand already notified)
+            if (isExpectedIncoming(address, tx.from(), tx.amount())) continue;
+
+            txListener.onIncomingTransaction(address, tx.from(), tx.amount());
+        }
+
+        if (maxTs > lastTs) {
+            lastProcessedTxTime.put(address, maxTs);
+        }
+    }
+
+    /**
+     * Checks if an incoming transaction matches a recorded expected incoming
+     * (from PayCommand/PayAddressCommand that already notified the receiver).
+     * If matched, the expected record is consumed (removed).
+     */
+    private boolean isExpectedIncoming(String toAddress, String fromAddress, long amount) {
+        var it = expectedIncomings.iterator();
+        while (it.hasNext()) {
+            var expected = it.next();
+            if (!expected.toAddress().equals(toAddress)) continue;
+            if (fromAddress != null && expected.fromAddress() != null
+                    && !expected.fromAddress().equals(fromAddress)) continue;
+            if (expected.amount() == amount) {
+                expectedIncomings.remove(expected);
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
